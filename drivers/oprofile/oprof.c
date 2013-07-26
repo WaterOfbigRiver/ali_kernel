@@ -22,6 +22,11 @@
 #include "buffer_sync.h"
 #include "oprofile_stats.h"
 
+#ifdef CONFIG_XEN
+#include <xen/xen.h>
+#include <xen/xenoprof.h>
+#endif
+
 struct oprofile_operations oprofile_ops;
 
 unsigned long oprofile_started;
@@ -34,6 +39,35 @@ static DEFINE_MUTEX(start_mutex);
    1 - use the timer int mechanism regardless
  */
 static int timer = 0;
+
+#ifdef CONFIG_XEN
+int oprofile_xen_set_active(int active_domains[], unsigned int adomains)
+{
+	int err;
+
+	if (!oprofile_ops.xen_set_active)
+		return -EINVAL;
+
+	mutex_lock(&start_mutex);
+	err = oprofile_ops.xen_set_active(active_domains, adomains);
+	mutex_unlock(&start_mutex);
+	return err;
+}
+
+int oprofile_xen_set_passive(int passive_domains[], unsigned int pdomains)
+{
+	int err;
+
+	if (!oprofile_ops.xen_set_passive)
+		return -EINVAL;
+
+	mutex_lock(&start_mutex);
+	err = oprofile_ops.xen_set_passive(passive_domains, pdomains);
+	mutex_unlock(&start_mutex);
+	return err;
+}
+#endif
+
 
 int oprofile_setup(void)
 {
@@ -225,40 +259,69 @@ post_sync:
 	mutex_unlock(&start_mutex);
 }
 
-int oprofile_set_ulong(unsigned long *addr, unsigned long val)
+int oprofile_set_backtrace(unsigned long val)
 {
-	int err = -EBUSY;
+	int err = 0;
 
 	mutex_lock(&start_mutex);
-	if (!oprofile_started) {
-		*addr = val;
-		err = 0;
-	}
-	mutex_unlock(&start_mutex);
 
+	if (oprofile_started) {
+		err = -EBUSY;
+		goto out;
+	}
+
+	if (!oprofile_ops.backtrace) {
+		err = -EINVAL;
+		goto out;
+	}
+
+	oprofile_backtrace_depth = val;
+
+out:
+	mutex_unlock(&start_mutex);
 	return err;
 }
 
 static int __init oprofile_init(void)
 {
 	int err;
+    int (*oprofile_arch_init_func)(struct oprofile_operations * ops);
+    void (*oprofile_arch_exit_func)(void);
 
-	err = oprofile_arch_init(&oprofile_ops);
+    if (xen_pv_domain())
+    {
+        oprofile_arch_init_func = xenoprofile_init;
+        oprofile_arch_exit_func = xenoprofile_exit;
+    }
+    else
+    {
+        oprofile_arch_init_func = oprofile_arch_init;
+        oprofile_arch_exit_func = oprofile_arch_exit;
+    }
+
+	err = oprofile_arch_init_func(&oprofile_ops);
+
 	if (err < 0 || timer) {
 		printk(KERN_INFO "oprofile: using timer interrupt.\n");
-		err = oprofile_timer_init(&oprofile_ops);
-		if (err)
-			return err;
+		oprofile_timer_init(&oprofile_ops);
 	}
-	return oprofilefs_register();
+
+	err = oprofilefs_register();
+	if (err)
+		oprofile_arch_exit_func();
+
+	return err;
 }
 
 
 static void __exit oprofile_exit(void)
 {
-	oprofile_timer_exit();
 	oprofilefs_unregister();
-	oprofile_arch_exit();
+
+	if (xen_pv_domain())
+		xenoprofile_exit();
+	else
+		oprofile_arch_exit();
 }
 
 

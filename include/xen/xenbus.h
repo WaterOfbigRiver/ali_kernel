@@ -91,9 +91,9 @@ struct xenbus_driver {
 	void (*otherend_changed)(struct xenbus_device *dev,
 				 enum xenbus_state backend_state);
 	int (*remove)(struct xenbus_device *dev);
-	int (*suspend)(struct xenbus_device *dev, pm_message_t state);
+	int (*suspend)(struct xenbus_device *dev);
 	int (*resume)(struct xenbus_device *dev);
-	int (*uevent)(struct xenbus_device *, char **, int, char *, int);
+	int (*uevent)(struct xenbus_device *, struct kobj_uevent_env *);
 	struct device_driver driver;
 	int (*read_otherend_details)(struct xenbus_device *dev);
 	int (*is_ready)(struct xenbus_device *dev);
@@ -173,7 +173,6 @@ void unregister_xenbus_watch(struct xenbus_watch *watch);
 void xs_suspend(void);
 void xs_resume(void);
 void xs_suspend_cancel(void);
-int xenbus_probe_init(void);
 
 /* Used by xenbus_dev to borrow kernel's store connection. */
 void *xenbus_dev_request_and_reply(struct xsd_sockmsg *msg);

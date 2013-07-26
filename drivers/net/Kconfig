@@ -2896,6 +2896,13 @@ config XEN_NETDEV_FRONTEND
 	  if you are compiling a kernel for a Xen guest, you almost
 	  certainly want to enable this.
 
+config XEN_NETDEV_BACKEND
+	tristate "Xen backend network device"
+	depends on XEN_BACKEND
+	help
+	  Implement the network backend driver, which passes packets
+	  from the guest domain's frontend drivers to the network.
+
 config ISERIES_VETH
 	tristate "iSeries Virtual Ethernet driver support"
 	depends on PPC_ISERIES

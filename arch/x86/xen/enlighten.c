@@ -28,9 +28,6 @@
 #include <linux/page-flags.h>
 #include <linux/highmem.h>
 #include <linux/console.h>
-#include <linux/pci.h>
-#include <linux/gfp.h>
-#include <linux/crash_dump.h>
 
 #include <xen/xen.h>
 #include <xen/interface/xen.h>
@@ -74,10 +71,14 @@ DEFINE_PER_CPU(struct vcpu_info, xen_vcpu_info);
 enum xen_domain_type xen_domain_type = XEN_NATIVE;
 EXPORT_SYMBOL_GPL(xen_domain_type);
 
+unsigned long *machine_to_phys_mapping = (void *)MACH2PHYS_VIRT_START;
+EXPORT_SYMBOL(machine_to_phys_mapping);
+unsigned int   machine_to_phys_order;
+EXPORT_SYMBOL(machine_to_phys_order);
+
 struct start_info *xen_start_info;
 EXPORT_SYMBOL_GPL(xen_start_info);
 
-static struct shared_info *shared_info_page;
 struct shared_info xen_dummy_shared_info;
 
 void *xen_initial_gdt;
@@ -106,6 +107,14 @@ struct shared_info *HYPERVISOR_shared_info = (void *)&xen_dummy_shared_info;
  */
 static int have_vcpu_info_placement = 1;
 
+static void clamp_max_cpus(void)
+{
+#ifdef CONFIG_SMP
+	if (setup_max_cpus > MAX_VIRT_CPUS)
+		setup_max_cpus = MAX_VIRT_CPUS;
+#endif
+}
+
 static void xen_vcpu_setup(int cpu)
 {
 	struct vcpu_register_vcpu_info info;
@@ -113,18 +122,19 @@ static void xen_vcpu_setup(int cpu)
 	struct vcpu_info *vcpup;
 
 	BUG_ON(HYPERVISOR_shared_info == &xen_dummy_shared_info);
-	per_cpu(xen_vcpu, cpu) = &HYPERVISOR_shared_info->vcpu_info[cpu];
 
-	if (!have_vcpu_info_placement)
-		return;		/* already tested, not available */
+	if (cpu < MAX_VIRT_CPUS)
+		per_cpu(xen_vcpu,cpu) = &HYPERVISOR_shared_info->vcpu_info[cpu];
+
+	if (!have_vcpu_info_placement) {
+		if (cpu >= MAX_VIRT_CPUS)
+			clamp_max_cpus();
+		return;
+	}
 
 	vcpup = &per_cpu(xen_vcpu_info, cpu);
-
 	info.mfn = arbitrary_virt_to_mfn(vcpup);
 	info.offset = offset_in_page(vcpup);
-
-	printk(KERN_DEBUG "trying to map vcpu_info %d at %p, mfn %llx, offset %d\n",
-	       cpu, vcpup, info.mfn, info.offset);
 
 	/* Check to see if the hypervisor will put the vcpu_info
 	   structure where we want it, which allows direct access via
@@ -134,13 +144,11 @@ static void xen_vcpu_setup(int cpu)
 	if (err) {
 		printk(KERN_DEBUG "register_vcpu_info failed: err=%d\n", err);
 		have_vcpu_info_placement = 0;
+		clamp_max_cpus();
 	} else {
 		/* This cpu is using the registered vcpu info, even if
 		   later ones fail to. */
 		per_cpu(xen_vcpu, cpu) = vcpup;
-
-		printk(KERN_DEBUG "cpu %d using vcpu_info at %p\n",
-		       cpu, vcpup);
 	}
 }
 
@@ -179,15 +187,16 @@ static void __init xen_banner(void)
 
 	printk(KERN_INFO "Booting paravirtualized kernel on %s\n",
 	       pv_info.name);
-	printk(KERN_INFO "Xen version: %d.%d%s%s\n",
+	printk(KERN_INFO "Xen version: %d.%d%s%s%s\n",
 	       version >> 16, version & 0xffff, extra.extraversion,
-	       xen_feature(XENFEAT_mmu_pt_update_preserve_ad) ? " (preserve-AD)" : "");
+	       xen_feature(XENFEAT_mmu_pt_update_preserve_ad) ?
+			" (preserve-AD)" : "",
+	       xen_initial_domain() ? " (dom0)" : "");
 }
 
 static __read_mostly unsigned int cpuid_leaf1_edx_mask = ~0;
 static __read_mostly unsigned int cpuid_leaf1_ecx_mask = ~0;
 static __read_mostly unsigned int cpuid_leaf81_edx_mask = ~0;
-static __read_mostly unsigned int cpuid_leaf87_edx_mask = 0;
 
 static void xen_cpuid(unsigned int *ax, unsigned int *bx,
 		      unsigned int *cx, unsigned int *dx)
@@ -206,9 +215,6 @@ static void xen_cpuid(unsigned int *ax, unsigned int *bx,
 		maskedx = cpuid_leaf1_edx_mask;
 		break;
 
-	case 5: /* CPUID_MWAIT_LEAF */
-		maskecx = maskedx = 0;
-
 	case 0xb:
 		/* Suppress extended topology stuff */
 		maskebx = 0;
@@ -216,10 +222,6 @@ static void xen_cpuid(unsigned int *ax, unsigned int *bx,
 
 	case 0x80000001:
 		maskedx = cpuid_leaf81_edx_mask;
-		break;
-
-	case 0x80000007:
-		maskedx = cpuid_leaf87_edx_mask;
 		break;
 	}
 
@@ -238,8 +240,7 @@ static void xen_cpuid(unsigned int *ax, unsigned int *bx,
 static __init void xen_init_cpuid_mask(void)
 {
 	unsigned int ax, bx, cx, dx;
-
-	cpuid_leaf1_ecx_mask = ~(1 << (X86_FEATURE_MWAIT % 32));
+	unsigned int xsave_mask;
 
 	cpuid_leaf1_edx_mask =
 		~(1 << X86_FEATURE_ACC);   /* thermal monitoring */
@@ -252,24 +253,16 @@ static __init void xen_init_cpuid_mask(void)
 			  (1 << X86_FEATURE_MCA)  |  /* disable MCA */
 			  (1 << X86_FEATURE_APIC) |  /* disable local APIC */
 			  (1 << X86_FEATURE_ACPI));  /* disable ACPI */
-
 	ax = 1;
-	cx = 0;
 	xen_cpuid(&ax, &bx, &cx, &dx);
 
-	/* cpuid claims we support xsave; try enabling it to see what happens */
-	if (cx & (1 << (X86_FEATURE_XSAVE % 32))) {
-		unsigned long cr4;
+	xsave_mask =
+		(1 << (X86_FEATURE_XSAVE % 32)) |
+		(1 << (X86_FEATURE_OSXSAVE % 32));
 
-		set_in_cr4(X86_CR4_OSXSAVE);
-		
-		cr4 = read_cr4();
-
-		if ((cr4 & X86_CR4_OSXSAVE) == 0)
-			cpuid_leaf1_ecx_mask &= ~(1 << (X86_FEATURE_XSAVE % 32));
-
-		clear_in_cr4(X86_CR4_OSXSAVE);
-	}
+	/* Xen will set CR4.OSXSAVE if supported and not disabled by force */
+	if ((cx & xsave_mask) != xsave_mask)
+		cpuid_leaf1_ecx_mask &= ~xsave_mask; /* disable XSAVE & OSXSAVE */
 }
 
 static void xen_set_debugreg(int reg, unsigned long val)
@@ -361,24 +354,6 @@ static void xen_set_ldt(const void *addr, unsigned entries)
 	xen_mc_issue(PARAVIRT_LAZY_CPU);
 }
 
-#ifdef CONFIG_X86_32
-static void xen_load_user_cs_desc(int cpu, struct mm_struct *mm)
-{
-	void *gdt;
-	xmaddr_t mgdt;
-	u64 descriptor;
-	struct desc_struct user_cs;
-
-	gdt = &get_cpu_gdt_table(cpu)[GDT_ENTRY_DEFAULT_USER_CS];
-	mgdt = virt_to_machine(gdt);
-
-	user_cs = mm->context.user_cs;
-	descriptor = (u64) user_cs.a | ((u64) user_cs.b) << 32;
-
-	HYPERVISOR_update_descriptor(mgdt.maddr, descriptor);
-}
-#endif /*CONFIG_X86_32*/
-
 static void xen_load_gdt(const struct desc_ptr *dtr)
 {
 	unsigned long va = dtr->address;
@@ -453,7 +428,7 @@ static __init void xen_load_gdt_boot(const struct desc_ptr *dtr)
 
 		pte = pfn_pte(pfn, PAGE_KERNEL_RO);
 
-		if (HYPERVISOR_update_va_mapping((unsigned long)va, pte, 0))
+		if (HYPERVISOR_update_va_mapping(va, pte, 0))
 			BUG();
 
 		frames[f] = mfn;
@@ -564,13 +539,13 @@ static int cvt_gate_to_trap(int vector, const gate_desc *val,
 		return 0;
 #ifdef CONFIG_X86_MCE
 	} else if (addr == (unsigned long)machine_check) {
-		return 0;
+		/* We can use the original machine_check handler,
+		   despite IST. */
 #endif
-	} else {
-		/* Some other trap using IST? */
-		if (WARN_ON(val->ist != 0))
-			return 0;
-	}
+	} else if (WARN(val->ist != 0,
+			"Unknown IST-using trap: vector %d, %pF, val->ist=%d\n",
+			vector, (void *)addr, val->ist))
+		return 0;
 #endif	/* CONFIG_X86_64 */
 	info->address = addr;
 
@@ -726,6 +701,18 @@ static void xen_set_iopl_mask(unsigned mask)
 	HYPERVISOR_physdev_op(PHYSDEVOP_set_iopl, &set_iopl);
 }
 
+static void xen_set_io_bitmap(struct thread_struct *thread,
+			      unsigned long bytes_updated)
+{
+	struct physdev_set_iobitmap set_iobitmap;
+
+	set_xen_guest_handle(set_iobitmap.bitmap,
+			     (char *)thread->io_bitmap_ptr);
+	set_iobitmap.nr_ports = thread->io_bitmap_ptr ? IO_BITMAP_BITS : 0;
+	WARN_ON(HYPERVISOR_physdev_op(PHYSDEVOP_set_iobitmap,
+				      &set_iobitmap));
+}
+
 static void xen_io_delay(void)
 {
 }
@@ -763,7 +750,7 @@ static u32 xen_safe_apic_wait_icr_idle(void)
         return 0;
 }
 
-static void set_xen_basic_apic_ops(void)
+static __init void set_xen_basic_apic_ops(void)
 {
 	apic->read = xen_apic_read;
 	apic->write = xen_apic_write;
@@ -819,7 +806,6 @@ static void xen_write_cr4(unsigned long cr4)
 {
 	cr4 &= ~X86_CR4_PGE;
 	cr4 &= ~X86_CR4_PSE;
-	cr4 &= ~X86_CR4_OSXSAVE;
 
 	native_write_cr4(cr4);
 }
@@ -856,6 +842,11 @@ static int xen_write_msr_safe(unsigned int msr, unsigned low, unsigned high)
 		/* Fast syscall setup is all done in hypercalls, so
 		   these are all ignored.  Stub them out here to stop
 		   Xen console noise. */
+		break;
+
+	case MSR_IA32_CR_PAT:
+		if (smp_processor_id() == 0)
+			xen_set_pat(((u64)high << 32) | low);
 		break;
 
 	default:
@@ -896,8 +887,6 @@ void xen_setup_vcpu_info_placement(void)
 	/* xen_vcpu_setup managed to place the vcpu_info within the
 	   percpu area for all cpus, so make use of it */
 	if (have_vcpu_info_placement) {
-		printk(KERN_INFO "Xen: using vcpu_info placement\n");
-
 		pv_irq_ops.save_fl = __PV_IS_CALLEE_SAVE(xen_save_fl_direct);
 		pv_irq_ops.restore_fl = __PV_IS_CALLEE_SAVE(xen_restore_fl_direct);
 		pv_irq_ops.irq_disable = __PV_IS_CALLEE_SAVE(xen_irq_disable_direct);
@@ -970,10 +959,6 @@ static const struct pv_init_ops xen_init_ops __initdata = {
 	.patch = xen_patch,
 };
 
-static const struct pv_time_ops xen_time_ops __initdata = {
-	.sched_clock = xen_clocksource_read,
-};
-
 static const struct pv_cpu_ops xen_cpu_ops __initdata = {
 	.cpuid = xen_cpuid,
 
@@ -1005,9 +990,6 @@ static const struct pv_cpu_ops xen_cpu_ops __initdata = {
 
 	.load_tr_desc = paravirt_nop,
 	.set_ldt = xen_set_ldt,
-#ifdef CONFIG_X86_32
-	.load_user_cs_desc = xen_load_user_cs_desc,
-#endif /*CONFIG_X86_32*/
 	.load_gdt = xen_load_gdt,
 	.load_idt = xen_load_idt,
 	.load_tls = xen_load_tls,
@@ -1028,6 +1010,7 @@ static const struct pv_cpu_ops xen_cpu_ops __initdata = {
 	.load_sp0 = xen_load_sp0,
 
 	.set_iopl_mask = xen_set_iopl_mask,
+	/* .set_io_bitmap = xen_set_io_bitmap, */
 	.io_delay = xen_io_delay,
 
 	/* Xen takes care of %gs when switching to usermode for us */
@@ -1066,6 +1049,14 @@ static void xen_machine_halt(void)
 	xen_reboot(SHUTDOWN_poweroff);
 }
 
+static void xen_machine_power_off(void)
+{
+	if (pm_power_off)
+		pm_power_off();
+	else
+		xen_reboot(SHUTDOWN_poweroff);
+}
+
 static void xen_crash_shutdown(struct pt_regs *regs)
 {
 	xen_reboot(SHUTDOWN_crash);
@@ -1074,10 +1065,7 @@ static void xen_crash_shutdown(struct pt_regs *regs)
 static int
 xen_panic_event(struct notifier_block *this, unsigned long event, void *ptr)
 {
-	struct sched_shutdown r = { .reason = SHUTDOWN_crash};
-
-	if (HYPERVISOR_sched_op(SCHEDOP_shutdown, &r))
-		BUG();
+	xen_reboot(SHUTDOWN_crash);
 	return NOTIFY_DONE;
 }
 
@@ -1094,7 +1082,7 @@ int xen_panic_handler_init(void)
 static const struct machine_ops __initdata xen_machine_ops = {
 	.restart = xen_restart,
 	.halt = xen_machine_halt,
-	.power_off = xen_machine_halt,
+	.power_off = xen_machine_power_off,
 	.shutdown = xen_machine_halt,
 	.crash_shutdown = xen_crash_shutdown,
 	.emergency_restart = xen_emergency_restart,
@@ -1124,13 +1112,16 @@ asmlinkage void __init xen_start_kernel(void)
 
 	if (!xen_start_info)
 		return;
-
+	xen_raw_console_write("1\n");
+	printk(KERN_DEBUG "start_kernel\n");
 	xen_domain_type = XEN_PV_DOMAIN;
+	xen_raw_console_write("2\n");
+	printk(KERN_DEBUG "xen_setup_machphys_mapping\n");
+	xen_setup_machphys_mapping();
 
 	/* Install Xen paravirt ops */
 	pv_info = xen_info;
 	pv_init_ops = xen_init_ops;
-	pv_time_ops = xen_time_ops;
 	pv_cpu_ops = xen_cpu_ops;
 	pv_apic_ops = xen_apic_ops;
 
@@ -1138,13 +1129,7 @@ asmlinkage void __init xen_start_kernel(void)
 	x86_init.oem.arch_setup = xen_arch_setup;
 	x86_init.oem.banner = xen_banner;
 
-	x86_init.timers.timer_init = xen_time_init;
-	x86_init.timers.setup_percpu_clockev = x86_init_noop;
-	x86_cpuinit.setup_percpu_clockev = x86_init_noop;
-
-	x86_platform.calibrate_tsc = xen_tsc_khz;
-	x86_platform.get_wallclock = xen_get_wallclock;
-	x86_platform.set_wallclock = xen_set_wallclock;
+	xen_init_time_ops();
 
 	/*
 	 * Set up some pagetable state before starting to set any ptes.
@@ -1169,18 +1154,25 @@ asmlinkage void __init xen_start_kernel(void)
 	/* Work out if we support NX */
 	check_efer();
 #endif
+	xen_raw_console_write("3\n");
+	printk(KERN_DEBUG "xen_setup_features\n");
 
 	xen_setup_features();
 
 	/* Get mfn list */
 	if (!xen_feature(XENFEAT_auto_translated_physmap))
 		xen_build_dynamic_phys_to_machine();
-
+	xen_raw_console_write("4\n");
+	printk(KERN_DEBUG "xen_setup_stackprotector");
 	/*
 	 * Set up kernel GDT and segment registers, mainly so that
 	 * -fstack-protector code can be executed.
 	 */
 	xen_setup_stackprotector();
+
+#ifdef CONFIG_SPARSE_IRQ
+	nr_dynamic_irqs += 256;
+#endif
 
 	xen_init_irq_ops();
 	xen_init_cpuid_mask();
@@ -1216,8 +1208,11 @@ asmlinkage void __init xen_start_kernel(void)
 	 */
 	acpi_numa = -1;
 #endif
-
+	xen_raw_console_write("5 the first time to deref xen_start_info\n");
+	printk(KERN_DEBUG "the first time to deref xen_start_info\n");
 	pgd = (pgd_t *)xen_start_info->pt_base;
+
+	__supported_pte_mask |= _PAGE_IOMAP;
 
 	/* Don't do the full vcpu_info placement stuff until we have a
 	   possible map and a non-dummy shared_info. */
@@ -1226,8 +1221,13 @@ asmlinkage void __init xen_start_kernel(void)
 	local_irq_disable();
 	early_boot_irqs_off();
 
+	printk(KERN_DEBUG "xen_setup_kernel_pagetable\n");
 	xen_raw_console_write("mapping kernel into physical memory\n");
 	pgd = xen_setup_kernel_pagetable(pgd, xen_start_info->nr_pages);
+	xen_ident_map_ISA();
+
+	/* Allocate and initialize top and mid mfn levels for p2m structure */
+	xen_build_mfn_list_list();
 
 	init_mm.pgd = pgd;
 
@@ -1236,6 +1236,14 @@ asmlinkage void __init xen_start_kernel(void)
 	pv_info.kernel_rpl = 1;
 	if (xen_feature(XENFEAT_supervisor_mode_kernel))
 		pv_info.kernel_rpl = 0;
+
+	if (xen_initial_domain()) {
+		struct physdev_set_iopl set_iopl;
+		set_iopl.iopl = 1;
+		if (HYPERVISOR_physdev_op(PHYSDEVOP_set_iopl, &set_iopl) == -1)
+			BUG();
+		xen_init_apic();
+	}
 
 	/* set the limit of our address space */
 	xen_reserve_top();
@@ -1259,11 +1267,17 @@ asmlinkage void __init xen_start_kernel(void)
 		add_preferred_console("xenboot", 0, NULL);
 		add_preferred_console("tty", 0, NULL);
 		add_preferred_console("hvc", 0, NULL);
+
+		boot_params.screen_info.orig_video_isVGA = 0;
 	} else {
-		/* Make sure ACS will be enabled */
-		pci_request_acs();
+		const struct dom0_vga_console_info *info =
+			(void *)((char *)xen_start_info +
+				 xen_start_info->console.dom0.info_off);
+
+		xen_init_vga(info, xen_start_info->console.dom0.info_size);
+		xen_start_info->console.domU.mfn = 0;
+		xen_start_info->console.domU.evtchn = 0;
 	}
-		
 
 	xen_raw_console_write("about to get started...\n");
 
@@ -1318,8 +1332,7 @@ static int init_hvm_pv_info(int *major, int *minor)
 
 	xen_setup_features();
 
-	pv_info = xen_info;
-	pv_info.kernel_rpl = 0;
+	pv_info.name = "Xen HVM";
 
 	xen_domain_type = XEN_HVM_DOMAIN;
 
@@ -1330,7 +1343,10 @@ void xen_hvm_init_shared_info(void)
 {
 	int cpu;
 	struct xen_add_to_physmap xatp;
+	static struct shared_info *shared_info_page = 0;
 
+	if (!shared_info_page)
+		shared_info_page = (struct shared_info *) alloc_bootmem_pages(PAGE_SIZE);
 	xatp.domid = DOMID_SELF;
 	xatp.idx = 0;
 	xatp.space = XENMAPSPACE_shared_info;
@@ -1353,6 +1369,7 @@ void xen_hvm_init_shared_info(void)
 	}
 }
 
+#ifdef CONFIG_XEN_PVHVM
 static int __cpuinit xen_hvm_cpu_notify(struct notifier_block *self,
 				    unsigned long action, void *hcpu)
 {
@@ -1360,6 +1377,8 @@ static int __cpuinit xen_hvm_cpu_notify(struct notifier_block *self,
 	switch (action) {
 	case CPU_UP_PREPARE:
 		per_cpu(xen_vcpu, cpu) = &HYPERVISOR_shared_info->vcpu_info[cpu];
+		if (xen_have_vector_callback)
+			xen_init_lock_cpu(cpu);
 		break;
 	default:
 		break;
@@ -1379,24 +1398,20 @@ void __init xen_hvm_guest_init(void)
 	if (xen_pv_domain())
 		return;
 
-	if (is_kdump_kernel())
-		return;
-
 	r = init_hvm_pv_info(&major, &minor);
 	if (r < 0)
 		return;
 
-	shared_info_page = (struct shared_info *)
-		alloc_bootmem_pages(PAGE_SIZE);
-
 	xen_hvm_init_shared_info();
-
-	xen_panic_handler_init();
 
 	if (xen_feature(XENFEAT_hvm_callback_vector))
 		xen_have_vector_callback = 1;
+	xen_hvm_smp_init();
 	register_cpu_notifier(&xen_hvm_cpu_notifier);
 	xen_unplug_emulated_devices();
 	have_vcpu_info_placement = 0;
 	x86_init.irqs.intr_init = xen_init_IRQ;
+	xen_hvm_init_time_ops();
+	xen_hvm_init_mmu_ops();
 }
+#endif

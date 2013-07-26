@@ -3937,6 +3937,8 @@ int get_nr_irqs_gsi(void)
 }
 
 #ifdef CONFIG_SPARSE_IRQ
+int nr_dynamic_irqs;
+
 int __init arch_probe_nr_irqs(void)
 {
 	int nr;
@@ -3953,6 +3955,8 @@ int __init arch_probe_nr_irqs(void)
 #endif
 	if (nr < nr_irqs)
 		nr_irqs = nr;
+
+	nr_irqs += nr_dynamic_irqs;
 
 	return 0;
 }

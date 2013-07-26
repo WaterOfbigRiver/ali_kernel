@@ -17,4 +17,7 @@ obj-y		:= enlighten.o setup.o multicalls.o mmu.o irq.o \
 obj-$(CONFIG_SMP)		+= smp.o
 obj-$(CONFIG_PARAVIRT_SPINLOCKS)+= spinlock.o
 obj-$(CONFIG_XEN_DEBUG_FS)	+= debugfs.o
-
+obj-$(CONFIG_XEN_DOM0)		+= vga.o
+obj-$(CONFIG_XEN_DOM0)		+= apic.o
+obj-$(CONFIG_SWIOTLB)		+= pci-swiotlb-xen.o
+obj-$(CONFIG_XEN_DOM0_PCI)	+= pci.o

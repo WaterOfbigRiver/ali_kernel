@@ -11,9 +11,10 @@ enum xen_domain_type {
 extern enum xen_domain_type xen_domain_type;
 extern void xen_hvm_guest_init(void);
 extern uint32_t xen_cpuid_base(void);
+
 #else
 #define xen_domain_type		XEN_NATIVE
-#define xen_hvm_guest_init() do {} while (0)
+#define xen_hvm_guest_init() do { } while (0)
 #endif
 
 #define xen_domain()		(xen_domain_type != XEN_NATIVE)

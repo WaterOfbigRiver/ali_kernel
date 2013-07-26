@@ -12,6 +12,8 @@ int bind_evtchn_to_irqhandler(unsigned int evtchn,
 			      irq_handler_t handler,
 			      unsigned long irqflags, const char *devname,
 			      void *dev_id);
+int bind_virq_to_irq(unsigned int virq, unsigned int cpu);
+
 int bind_virq_to_irqhandler(unsigned int virq, unsigned int cpu,
 			    irq_handler_t handler,
 			    unsigned long irqflags, const char *devname,
@@ -22,6 +24,12 @@ int bind_ipi_to_irqhandler(enum ipi_vector ipi,
 			   unsigned long irqflags,
 			   const char *devname,
 			   void *dev_id);
+int bind_interdomain_evtchn_to_irqhandler(unsigned int remote_domain,
+					  unsigned int remote_port,
+					  irq_handler_t handler,
+					  unsigned long irqflags,
+					  const char *devname,
+					  void *dev_id);
 
 /*
  * Common unbind function for all event sources. Takes IRQ to unbind from.
@@ -53,9 +61,37 @@ bool xen_test_irq_pending(int irq);
    irq will be disabled so it won't deliver an interrupt. */
 void xen_poll_irq(int irq);
 
+/* Poll waiting for an irq to become pending with a timeout.  In the usual case, the
+   irq will be disabled so it won't deliver an interrupt. */
+void xen_poll_irq_timeout(int irq, u64 timeout);
+
 /* Determine the IRQ which is bound to an event channel */
 unsigned irq_from_evtchn(unsigned int evtchn);
 
+/* Allocate an irq for a physical interrupt, given a gsi.  "Legacy"
+   GSIs are identity mapped; others are dynamically allocated as
+   usual. */
+int xen_allocate_pirq(unsigned gsi, int shareable, char *name);
+
+/* De-allocates the above mentioned physical interrupt. */
+int xen_destroy_irq(int irq);
+
+/* Return vector allocated to pirq */
+int xen_vector_from_irq(unsigned pirq);
+
+/* Return gsi allocated to pirq */
+int xen_gsi_from_irq(unsigned pirq);
+
+#ifdef CONFIG_XEN_DOM0_PCI
+void xen_setup_pirqs(void);
+#else
+static inline void xen_setup_pirqs(void)
+{
+}
+#endif
+
+/* Determine whether to ignore this IRQ if passed to a guest. */
+int xen_ignore_irq(int irq);
 /* Xen HVM evtchn vector callback */
 extern void xen_hvm_callback_vector(void);
 extern int xen_have_vector_callback;

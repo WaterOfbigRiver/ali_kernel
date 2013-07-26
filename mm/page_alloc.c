@@ -685,6 +685,12 @@ static void __free_pages_ok(struct page *page, unsigned int order)
 	if (bad)
 		return;
 
+#ifdef CONFIG_XEN
+	if (PageForeign(page)) {
+		PageForeignDestructor(page, order);
+		return;
+	}
+#endif
 	if (!PageHighMem(page)) {
 		debug_check_no_locks_freed(page_address(page),PAGE_SIZE<<order);
 		debug_check_no_obj_freed(page_address(page),
@@ -1182,6 +1188,12 @@ static void free_hot_cold_page(struct page *page, int cold)
 
 	kmemcheck_free_shadow(page, 0);
 
+#ifdef CONFIG_XEN
+	if (PageForeign(page)) {
+		PageForeignDestructor(page, 0);
+		return;
+	}
+#endif
 	if (PageAnon(page))
 		page->mapping = NULL;
 	if (free_pages_check(page))

@@ -34,7 +34,6 @@
 #include <linux/module.h>
 #include <linux/sched.h>
 #include <linux/mm.h>
-#include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/uaccess.h>
 #include <linux/io.h>
@@ -503,6 +502,104 @@ static int gnttab_map(unsigned int start_idx, unsigned int end_idx)
 	return 0;
 }
 
+static void gnttab_page_free(struct page *page, unsigned int order)
+{
+	BUG_ON(order);
+	ClearPageForeign(page);
+	gnttab_reset_grant_page(page);
+	put_page(page);
+}
+
+/*
+ * Must not be called with IRQs off.  This should only be used on the
+ * slow path.
+ *
+ * Copy a foreign granted page to local memory.
+ */
+int gnttab_copy_grant_page(grant_ref_t ref, struct page **pagep)
+{
+	struct gnttab_unmap_and_replace unmap;
+	struct mmu_update mmu;
+	struct page *page;
+	struct page *new_page;
+	void *new_addr;
+	void *addr;
+	unsigned long pfn;
+	unsigned long mfn;
+	unsigned long new_mfn;
+	int err;
+
+	page = *pagep;
+	if (!get_page_unless_zero(page))
+		return -ENOENT;
+
+	err = -ENOMEM;
+	new_page = alloc_page(GFP_ATOMIC | __GFP_NOWARN);
+	if (!new_page)
+		goto out;
+
+	new_addr = page_address(new_page);
+	addr = page_address(page);
+	memcpy(new_addr, addr, PAGE_SIZE);
+
+	pfn = page_to_pfn(page);
+	mfn = pfn_to_mfn(pfn);
+	new_mfn = virt_to_mfn(new_addr);
+
+	/* Make seq visible before checking page_mapped. */
+	smp_mb();
+
+	/* Has the page been DMA-mapped? */
+	if (unlikely(page_mapped(page))) {
+		put_page(new_page);
+		err = -EBUSY;
+		goto out;
+	}
+
+	if (!xen_feature(XENFEAT_auto_translated_physmap))
+		set_phys_to_machine(pfn, new_mfn);
+
+	unmap.host_addr = (unsigned long)addr;
+	unmap.new_addr = (unsigned long)new_addr;
+	unmap.handle = ref;
+
+	err = HYPERVISOR_grant_table_op(GNTTABOP_unmap_and_replace,
+					&unmap, 1);
+	BUG_ON(err);
+	BUG_ON(unmap.status);
+
+	if (!xen_feature(XENFEAT_auto_translated_physmap)) {
+		set_phys_to_machine(page_to_pfn(new_page), INVALID_P2M_ENTRY);
+
+		mmu.ptr = PFN_PHYS(new_mfn) | MMU_MACHPHYS_UPDATE;
+		mmu.val = pfn;
+		err = HYPERVISOR_mmu_update(&mmu, 1, NULL, DOMID_SELF);
+		BUG_ON(err);
+	}
+
+	new_page->mapping = page->mapping;
+	SetPageForeign(new_page, _PageForeignDestructor(page));
+	if (PageReserved(page))
+		SetPageReserved(new_page);
+	*pagep = new_page;
+
+	SetPageForeign(page, gnttab_page_free);
+	ClearPageReserved(page);
+	page->mapping = NULL;
+
+out:
+	put_page(page);
+	return err;
+}
+EXPORT_SYMBOL_GPL(gnttab_copy_grant_page);
+
+void gnttab_reset_grant_page(struct page *page)
+{
+	init_page_count(page);
+	reset_page_mapcount(page);
+}
+EXPORT_SYMBOL_GPL(gnttab_reset_grant_page);
+
 int gnttab_resume(void)
 {
 	unsigned int max_nr_gframes;
@@ -518,7 +615,7 @@ int gnttab_resume(void)
 		shared = ioremap(xen_hvm_resume_frames, PAGE_SIZE * max_nr_gframes);
 		if (shared == NULL) {
 			printk(KERN_WARNING
-					"Fail to ioremap gnttab share frames\n");
+					"Failed to ioremap gnttab share frames!");
 			return -ENOMEM;
 		}
 	}

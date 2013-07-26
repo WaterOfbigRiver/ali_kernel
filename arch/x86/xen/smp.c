@@ -306,6 +306,8 @@ static int __cpuinit xen_cpu_up(unsigned int cpu)
 	xen_setup_timer(cpu);
 	xen_init_lock_cpu(cpu);
 
+	cpumask_set_cpu(cpu, cpu_callout_mask);
+
 	per_cpu(cpu_state, cpu) = CPU_UP_PREPARE;
 
 	/* make sure interrupts start blocked */
@@ -399,6 +401,8 @@ static void stop_self(void *v)
 	load_cr3(swapper_pg_dir);
 	/* should set up a minimal gdt */
 
+	set_cpu_online(cpu, false);
+
 	HYPERVISOR_vcpu_op(VCPUOP_down, cpu, NULL);
 	BUG();
 }
@@ -485,4 +489,42 @@ void __init xen_smp_init(void)
 	smp_ops = xen_smp_ops;
 	xen_fill_possible_map();
 	xen_init_spinlocks();
+}
+
+static void __init xen_hvm_smp_prepare_cpus(unsigned int max_cpus)
+{
+	native_smp_prepare_cpus(max_cpus);
+	WARN_ON(xen_smp_intr_init(0));
+
+	if (!xen_have_vector_callback)
+		return;
+	xen_init_lock_cpu(0);
+	xen_init_spinlocks();
+}
+
+static int __cpuinit xen_hvm_cpu_up(unsigned int cpu)
+{
+	int rc;
+	rc = native_cpu_up(cpu);
+	WARN_ON (xen_smp_intr_init(cpu));
+	return rc;
+}
+
+static void xen_hvm_cpu_die(unsigned int cpu)
+{
+	unbind_from_irqhandler(per_cpu(resched_irq, cpu), NULL);
+	unbind_from_irqhandler(per_cpu(callfunc_irq, cpu), NULL);
+	unbind_from_irqhandler(per_cpu(debug_irq, cpu), NULL);
+	unbind_from_irqhandler(per_cpu(callfuncsingle_irq, cpu), NULL);
+	native_cpu_die(cpu);
+}
+
+void __init xen_hvm_smp_init(void)
+{
+	smp_ops.smp_prepare_cpus = xen_hvm_smp_prepare_cpus;
+	smp_ops.smp_send_reschedule = xen_smp_send_reschedule;
+	smp_ops.cpu_up = xen_hvm_cpu_up;
+	smp_ops.cpu_die = xen_hvm_cpu_die;
+	smp_ops.send_call_func_ipi = xen_smp_send_call_function_ipi;
+	smp_ops.send_call_func_single_ipi = xen_smp_send_call_function_single_ipi;
 }

@@ -24,8 +24,15 @@ typedef unsigned int RING_IDX;
  * A ring contains as many entries as will fit, rounded down to the nearest
  * power of two (so we can mask with (size-1) to loop around).
  */
-#define __RING_SIZE(_s, _sz) \
-    (__RD32(((_sz) - (long)&(_s)->ring + (long)(_s)) / sizeof((_s)->ring[0])))
+#define __CONST_RING_SIZE(_s, _sz)				\
+	(__RD32(((_sz) - offsetof(struct _s##_sring, ring)) /	\
+		sizeof(((struct _s##_sring *)0)->ring[0])))
+
+/*
+ * The same for passing in an actual pointer instead of a name tag.
+ */
+#define __RING_SIZE(_s, _sz)						\
+	(__RD32(((_sz) - (long)&(_s)->ring + (long)(_s)) / sizeof((_s)->ring[0])))
 
 /*
  * Macros to make the correct C datatypes for a new kind of ring.
@@ -73,7 +80,16 @@ union __name##_sring_entry {						\
 struct __name##_sring {							\
     RING_IDX req_prod, req_event;					\
     RING_IDX rsp_prod, rsp_event;					\
-    uint8_t  pad[48];							\
+    union {								\
+        struct {							\
+            uint8_t smartpoll_active;					\
+        } netif;							\
+        struct {							\
+            uint8_t msg;						\
+        } tapif_user;							\
+        uint8_t pvt_pad[4];						\
+    } private;								\
+    uint8_t pad[44];							\
     union __name##_sring_entry ring[1]; /* variable-length */		\
 };									\
 									\

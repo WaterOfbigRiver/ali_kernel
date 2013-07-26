@@ -1923,6 +1923,10 @@ config PCI_OLPC
 	def_bool y
 	depends on PCI && OLPC && (PCI_GOOLPC || PCI_GOANY)
 
+config PCI_XEN
+	bool
+	select SWIOTLB
+
 config PCI_DOMAINS
 	def_bool y
 	depends on PCI

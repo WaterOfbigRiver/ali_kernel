@@ -10,6 +10,7 @@
 #include <linux/pm.h>
 
 #include <asm/elf.h>
+#include <asm/hpet.h>
 #include <asm/vdso.h>
 #include <asm/e820.h>
 #include <asm/setup.h>
@@ -17,6 +18,7 @@
 #include <asm/xen/hypervisor.h>
 #include <asm/xen/hypercall.h>
 
+#include <xen/xen.h>
 #include <xen/page.h>
 #include <xen/interface/callback.h>
 #include <xen/interface/memory.h>
@@ -37,13 +39,13 @@ extern void xen_syscall32_target(void);
 /* Amount of extra memory space we add to the e820 ranges */
 phys_addr_t xen_extra_mem_start, xen_extra_mem_size;
 
-/*
+/* 
  * The maximum amount of extra memory compared to the base size.  The
  * main scaling factor is the size of struct page.  At extreme ratios
  * of base:extra, all the base memory can be filled with page
  * structures for the extra memory, leaving no space for anything
  * else.
- *
+ * 
  * 10x seems like a reasonable balance between scaling flexibility and
  * leaving a practically usable system.
  */
@@ -51,8 +53,6 @@ phys_addr_t xen_extra_mem_start, xen_extra_mem_size;
 
 static __init void xen_add_extra_mem(unsigned long pages)
 {
-	unsigned long pfn;
-
 	u64 size = (u64)pages * PAGE_SIZE;
 	u64 extra_start = xen_extra_mem_start + xen_extra_mem_size;
 
@@ -67,9 +67,6 @@ static __init void xen_add_extra_mem(unsigned long pages)
 	xen_extra_mem_size += size;
 
 	xen_max_p2m_pfn = PFN_DOWN(extra_start + size);
-
-	for (pfn = PFN_DOWN(extra_start); pfn <= xen_max_p2m_pfn; pfn++)
-		__set_phys_to_machine(pfn, INVALID_P2M_ENTRY);
 }
 
 static unsigned long __init xen_release_chunk(phys_addr_t start_addr,
@@ -108,7 +105,7 @@ static unsigned long __init xen_release_chunk(phys_addr_t start_addr,
 		WARN(ret != 1, "Failed to release memory %lx-%lx err=%d\n",
 		     start, end, ret);
 		if (ret == 1) {
-			__set_phys_to_machine(pfn, INVALID_P2M_ENTRY);
+			set_phys_to_machine(pfn, INVALID_P2M_ENTRY);
 			len++;
 		}
 	}
@@ -121,16 +118,18 @@ static unsigned long __init xen_return_unused_memory(unsigned long max_pfn,
 						     const struct e820map *e820)
 {
 	phys_addr_t max_addr = PFN_PHYS(max_pfn);
-	phys_addr_t last_end = 0;
+	phys_addr_t last_end = ISA_END_ADDRESS;
 	unsigned long released = 0;
 	int i;
 
+	/* Free any unused memory above the low 1Mbyte. */
 	for (i = 0; i < e820->nr_map && last_end < max_addr; i++) {
 		phys_addr_t end = e820->map[i].addr;
 		end = min(max_addr, end);
 
-		released += xen_release_chunk(last_end, end);
-		last_end = e820->map[i].addr + e820->map[i].size;
+		if (last_end < end)
+			released += xen_release_chunk(last_end, end);
+		last_end = max(last_end, e820->map[i].addr + e820->map[i].size);
 	}
 
 	if (last_end < max_addr)
@@ -138,18 +137,6 @@ static unsigned long __init xen_return_unused_memory(unsigned long max_pfn,
 
 	printk(KERN_INFO "released %ld pages of unused memory\n", released);
 	return released;
-}
-
-static unsigned long __init xen_get_max_pages(void)
-{
-	unsigned long max_pages = MAX_DOMAIN_PAGES;
-	domid_t domid = DOMID_SELF;
-	int ret;
-
-	ret = HYPERVISOR_memory_op(XENMEM_maximum_reservation, &domid);
-	if (ret > 0)
-		max_pages = ret;
-	return min(max_pages, MAX_DOMAIN_PAGES);
 }
 
 /**
@@ -165,6 +152,7 @@ char * __init xen_memory_setup(void)
 	struct xen_memory_map memmap;
 	unsigned long extra_pages = 0;
 	unsigned long extra_limit;
+	int op;
 	int i;
 
 	max_pfn = min(MAX_DOMAIN_PAGES, max_pfn);
@@ -173,8 +161,12 @@ char * __init xen_memory_setup(void)
 	memmap.nr_entries = E820MAX;
 	set_xen_guest_handle(memmap.buffer, map);
 
-	rc = HYPERVISOR_memory_op(XENMEM_memory_map, &memmap);
+	op = xen_initial_domain() ?
+		XENMEM_machine_memory_map :
+		XENMEM_memory_map;
+	rc = HYPERVISOR_memory_op(op, &memmap);
 	if (rc == -ENOSYS) {
+		BUG_ON(xen_initial_domain());
 		memmap.nr_entries = 1;
 		map[0].addr = 0ULL;
 		map[0].size = mem_end;
@@ -188,8 +180,13 @@ char * __init xen_memory_setup(void)
 	e820.nr_map = 0;
 	xen_extra_mem_start = mem_end;
 	for (i = 0; i < memmap.nr_entries; i++) {
-		unsigned long long end = map[i].addr + map[i].size;
+		unsigned long long end;
 
+		/* Guard against non-page aligned E820 entries. */
+		if (map[i].type == E820_RAM)
+			map[i].size -= (map[i].size + map[i].addr) % PAGE_SIZE;
+
+		end = map[i].addr + map[i].size;
 		if (map[i].type == E820_RAM && end > mem_end) {
 			/* RAM off the end - may be partially included */
 			u64 delta = min(map[i].size, end - mem_end);
@@ -198,6 +195,15 @@ char * __init xen_memory_setup(void)
 			end -= delta;
 
 			extra_pages += PFN_DOWN(delta);
+			/*
+			 * Set RAM below 4GB that is not for us to be unusable.
+			 * This prevents "System RAM" address space from being
+			 * used as potential resource for I/O address (happens
+			 * when 'allocate_resource' is called).
+			 */
+			if (delta &&
+				(xen_initial_domain() && end < 0x100000000ULL))
+				e820_add_region(end, delta, E820_UNUSABLE);
 		}
 
 		if (map[i].size > 0 && end > xen_extra_mem_start)
@@ -209,9 +215,13 @@ char * __init xen_memory_setup(void)
 	}
 
 	/*
-	 * Even though this is normal, usable memory under Xen, reserve
-	 * ISA memory anyway because too many things think they can poke
+	 * In domU, the ISA region is normal, usable memory, but we
+	 * reserve ISA memory anyway because too many things poke
 	 * about in there.
+	 *
+	 * In Dom0, the host E820 information can leave gaps in the
+	 * ISA range, which would cause us to release those pages.  To
+	 * avoid this, we unconditionally reserve them here.
 	 */
 	e820_add_region(ISA_START_ADDRESS, ISA_END_ADDRESS - ISA_START_ADDRESS,
 			E820_RESERVED);
@@ -227,14 +237,6 @@ char * __init xen_memory_setup(void)
 			"XEN START INFO");
 
 	sanitize_e820_map(e820.map, ARRAY_SIZE(e820.map), &e820.nr_map);
-
-	extra_limit = xen_get_max_pages();
-	if (max_pfn + extra_pages > extra_limit) {
-		if (extra_limit >= max_pfn)
-			extra_pages = extra_limit - max_pfn;
-		else
-			extra_pages = 0;
-	}
 
 	extra_pages += xen_return_unused_memory(xen_start_info->nr_pages, &e820);
 
@@ -260,20 +262,6 @@ char * __init xen_memory_setup(void)
 	xen_add_extra_mem(extra_pages);
 
 	return "Xen";
-}
-
-static void xen_idle(void)
-{
-	local_irq_disable();
-
-	if (need_resched())
-		local_irq_enable();
-	else {
-		current_thread_info()->status &= ~TS_POLLING;
-		smp_mb__after_clear_bit();
-		safe_halt();
-		current_thread_info()->status |= TS_POLLING;
-	}
 }
 
 /*
@@ -376,13 +364,21 @@ void __init xen_arch_setup(void)
 	}
 #endif
 
+	/* 
+	 * Xen hypervisor uses HPET to wakeup cpu from deep c-states,
+	 * so the HPET usage in dom0 must be forbidden.
+	 */
+	disable_hpet(NULL);
+
 	memcpy(boot_command_line, xen_start_info->cmd_line,
 	       MAX_GUEST_CMDLINE > COMMAND_LINE_SIZE ?
 	       COMMAND_LINE_SIZE : MAX_GUEST_CMDLINE);
 
-	pm_idle = xen_idle;
-
-	paravirt_disable_iospace();
+	/* Set up idle, making sure it calls safe_halt() pvop */
+#ifdef CONFIG_X86_32
+	boot_cpu_data.hlt_works_ok = 1;
+#endif
+	pm_idle = default_idle;
 
 	fiddle_vdso();
 }

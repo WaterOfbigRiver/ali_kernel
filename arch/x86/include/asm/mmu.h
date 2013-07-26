@@ -20,6 +20,9 @@ typedef struct {
 	struct desc_struct user_cs;
 	unsigned long exec_limit;
 #endif
+#ifdef CONFIG_XEN
+	int has_foreign_mappings;
+#endif
 } mm_context_t;
 
 #ifdef CONFIG_SMP

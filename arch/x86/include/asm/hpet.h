@@ -69,6 +69,7 @@ extern u8 hpet_blockid;
 extern int hpet_force_user;
 extern u8 hpet_msi_disable;
 extern int is_hpet_enabled(void);
+extern int disable_hpet(char *);
 extern int hpet_enable(void);
 extern void hpet_disable(void);
 extern unsigned long hpet_readl(unsigned long a);
@@ -110,6 +111,7 @@ extern void hpet_unregister_irq_handler(rtc_irq_handler handler);
 
 static inline int hpet_enable(void) { return 0; }
 static inline int is_hpet_enabled(void) { return 0; }
+static inline int disable_hpet(char *s) { return 0; }
 #define hpet_readl(a) 0
 
 #endif

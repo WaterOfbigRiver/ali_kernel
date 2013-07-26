@@ -112,6 +112,12 @@ extern unsigned int kobjsize(const void *objp);
 #if BITS_PER_LONG > 32
 #define VM_HUGEPAGE	0x100000000UL	/* MADV_HUGEPAGE marked this vma */
 #endif
+#ifdef CONFIG_XEN
+#define VM_FOREIGN	0x20000000      /* Has pages belonging to another VM */
+struct vm_foreign_map {
+        struct page **map;
+};
+#endif
 
 /* Bits set in the VMA until the stack is in its final location */
 #define VM_STACK_INCOMPLETE_SETUP	(VM_RAND_READ | VM_SEQ_READ)
@@ -208,6 +214,12 @@ struct vm_operations_struct {
 	 */
 	int (*access)(struct vm_area_struct *vma, unsigned long addr,
 		      void *buf, int len, int write);
+#ifdef CONFIG_XEN
+	/* Area-specific function for clearing the PTE at @ptep. Returns the
+	 * original value of @ptep. */
+	pte_t (*zap_pte)(struct vm_area_struct *vma, 
+			 unsigned long addr, pte_t *ptep, int is_fullmm);
+#endif
 #ifdef CONFIG_NUMA
 	/*
 	 * set_policy() op must add a reference to any non-NULL @new mempolicy
